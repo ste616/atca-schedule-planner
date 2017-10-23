@@ -332,17 +332,25 @@ for i in xrange(0, len(segmentTimes)):
     segmentSeeds.append(None)
     print "  there are %d sources up in this segment" % len(ssources)
 
-while None in segmentSeeds:
+while None in segmentSeeds and segmentsUp:
     # Find the most constraining source, and we'll lock it in as the immovable object.
-    seedSource = min(segmentsUp, key=segmentsUp.get)
-    print "most constraining source is %s, which is observable in only %d segments" % (seedSource, segmentsUp[seedSource])
+    seedSourceName = min(segmentsUp, key=segmentsUp.get)
+    print "most constraining source is %s, which is observable in only %d segments" % (seedSourceName, segmentsUp[seedSourceName])
+    seedSource = None
+    for i in xrange(0, len(sourceList)):
+        if seedSourceName == sourceList[i].name:
+            seedSource = sourceList[i]
+            break
+    if seedSource is None:
+        del segmentsUp[seedSourceName]
+        continue
     # Check all other seed sources, to make sure this one is not very close to those
     # others.
     sourceFailed = False
     for i in xrange(0, len(segmentSeeds)):
         if segmentSeeds[i] is not None:
             seedPosition = timeToPosition(segmentSeeds[i], atca, segmentTimes[i])
-            checkPosition = timetoPosition(seedSource, atca, segmentTimes[i])
+            checkPosition = timeToPosition(seedSource, atca, segmentTimes[i])
             slew = calcSlewTime(seedPosition, checkPosition) / 60. # in minutes.
             if slew < args.slewing:
                 print "   source too close to another seed"
@@ -350,15 +358,42 @@ while None in segmentSeeds:
                 break
     if sourceFailed == True:
         print " source is not suitable for seeding"
-        del segmentsUp[seedSource]
+        del segmentsUp[seedSourceName]
         continue
-    # Seed these segments. Get the first segment it is up in.
+    # Can we seed some segments.
+    psegments = []
     for i in xrange(0, len(segmentSources)):
         if seedSource in segmentSources[i]:
             if segmentSeeds[i] is None:
-                
+                if len(psegments) > 0 and (i - psegments[-1]) < 2:
+                    continue
+                if i > 0 and segmentSeeds[i - 1] is not None:
+                    # Check we're not too far away from this seed.
+                    seedPosition = timeToPosition(segmentSeeds[i - 1], atca, segmentTimes[i - 1])
+                    checkPosition = timeToPosition(seedSource, atca, segmentTimes[i])
+                    slew = calcSlewTime(seedPosition, checkPosition) / 60.
+                    if slew > args.adjacent:
+                        continue
+                if (i + 1) < len(segmentSources) and segmentSeeds[i + 1] is not None:
+                    seedPosition = timeToPosition(segmentSeeds[i + 1], atca, segmentTimes[i + 1])
+                    checkPosition = timeToPosition(seedSource, atca, segmentTimes[i])
+                    slew = calcSlewTime(seedPosition, checkPosition) / 60.
+                    if slew > args.adjacent:
+                        continue
+                psegments.append(i)
+    if len(psegments) >= args.nvisits:
+        # We can add this source as some seeds.
+        for i in xrange(0, args.nvisits):
+            print "Adding %s as seed of segment %d" % (seedSourceName, psegments[i])
+            segmentSeeds[psegments[i]] = seedSource
+    del segmentsUp[seedSourceName]
 
-
+for i in xrange(0, len(segmentSeeds)):
+    if segmentSeeds[i] is None:
+        print "Segment %d has no seed" % (i + 1)
+    else:
+        print "Segment %d is seeded by %s" % ((i + 1), segmentSeeds[i].name)
+    
 sys.exit(0)
 
 # Now start the program.
