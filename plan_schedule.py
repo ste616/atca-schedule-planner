@@ -15,6 +15,7 @@ import sys
 import math
 import argparse
 import os
+import time
 import cabb_scheduler as cabb
 import rapid_library.routines as rapidlib
 
@@ -156,6 +157,58 @@ def programEntry(source=None, observatory=None, startTime=None, duration=None):
                          'az': (source.az * 180.0 / math.pi), 'el': (source.alt * 180.0 / math.pi) }
         return entry
     return None
+
+def lstToSeconds(lstString):
+    comps = lstString.split(":")
+    if len(comps) != 3:
+        return 0.
+    lst = float(comps[0]) * 3600. + float(comps[1]) * 60. + float(comps[2])
+    return lst
+
+def prepareMosaic(fileList=None, mosaicFile=None, lst=None, refPos=None, interval=None, nCycles=None, seed=None):
+    # Make a mosaic file and interpret the results.
+    if (fileList is not None and mosaicFile is not None and lst is not None and refPos is not None and
+        interval is not None and nCycles is not None):
+        atmosCommand = "atmos source=%s out=%s.mos %s lst=%s interval=%d cycles=%d> /dev/null" % (fileList, mosaicFile, refpos, lst, interval, nCycles)
+        os.system(atmosCommand)
+        # Read in the order it was sorted into.
+        segstart = ""
+        segend = ""
+        segra = ""
+        segdec = ""
+        sources = []
+        ordered = []
+        with open('%s%d.mos' % (args.mosaic, i), 'r') as ipf:
+            iline = ipf.readline()
+            while (iline != ""):
+                if iline.startswith("#") == False:
+                    linel = [ x.strip() for x in iline.split(" ") ]
+                    sname = linel[-1].replace('$', '')
+                    ordered.append(sname)
+                    if seed is None or seed != sname:
+                        sources.append(sname)
+                else:
+                    linel = [ x.strip() for x in iline.split(" ") ]
+                    if iline.startswith("# Start LST is"):
+                        segstart = linel[4]
+                    elif iline.startswith("# End LST is"):
+                        segend = linel[4]
+                    elif iline.startswith("# Reference position ="):
+                        segra = linel[4]
+                        segdec = linel[5]
+                iline = ipf.readline()
+        # Work out how long this schedule goes for.
+        startLst = lstToSeconds(segstart)
+        endLst = lstToSeconds(segend)
+        if endLst < startLst:
+            # Date change.
+            endLst += 86400.
+        duration = (endLst - startLst) * ((23.+ 56. / 60.) / 24.)
+        return { 'startLST': segstart, 'endLST': segend, 'sources': sources,
+                 'orderedSources': ordered,
+                 'refRA': segra, 'refDec': segdec, 'duration': duration }
+    return None
+        
 
 # Arguments to the script should be:
 # 1. name of the source list, either JSON (.json) or CSV (.csv, .txt).
@@ -481,37 +534,44 @@ for i in xrange(0, len(segmentSeeds)):
         refpos = "ref=%s,%s,%s" % (lastSource.name, lastSource.a_ra,
                                    lastSource.a_dec)
     atca.date = segmentTimes[i]
-    atmosCommand = "atmos source=temp_atmos.txt out=%s%d.mos %s lst=%s interval=%d cycles=%d> /dev/null" % (args.mosaic, i, refpos, atca.sidereal_time(), int(args.cycletime), int((args.duration * 60.) / args.cycletime))
-    os.system(atmosCommand)
-    # Read in the order it was sorted into.
-    segstart = ""
-    segend = ""
-    segra = ""
-    segdec = ""
-    seedAssociations[segmentSeeds[i].name] = []
-    with open('%s%d.mos' % (args.mosaic, i), 'r') as ipf:
-        iline = ipf.readline()
-        while (iline != ""):
-            if iline.startswith("#") == False:
-                linel = [ x.strip() for x in iline.split(" ") ]
-                sname = linel[-1].replace('$', '')
-                segmentOrdered[i].append(tstore[sname])
-                if sname != segmentSeeds[i].name:
-                    seedAssociations[segmentSeeds[i].name].append(tstore[sname])
-                lastSource = tstore[sname]
-            else:
-                linel = [ x.strip() for x in iline.split(" ") ]
-                if iline.startswith("# Start LST is"):
-                    segstart = linel[4]
-                elif iline.startswith("# End LST is"):
-                    segend = linel[4]
-                elif iline.startswith("# Reference position ="):
-                    segra = linel[4]
-                    segdec = linel[5]
-            iline = ipf.readline()
+    stuff = prepareMosaic(fileList="temp_atmos.txt", mosaicFile="%s%d" % (args.mosaic, i), seed=segmentSeeds[i].name,
+                          lst=atca.sidereal_time(), refPos=refpos, interval=int(args.cycletime),
+                          nCycles=int((args.duration * 60.) / args.cycletime))
+    #atmosCommand = "atmos source=temp_atmos.txt out=%s%d.mos %s lst=%s interval=%d cycles=%d> /dev/null" % (args.mosaic, i, refpos, atca.sidereal_time(), int(args.cycletime), int((args.duration * 60.) / args.cycletime))
+    #os.system(atmosCommand)
+    ## Read in the order it was sorted into.
+    #segstart = ""
+    #segend = ""
+    #segra = ""
+    #segdec = ""
+    #seedAssociations[segmentSeeds[i].name] = []
+    seedAssociations[segmentSeeds[i].name] = [ tstore[x] for x in stuff['sources'] ]
+    segmentOrdered[i] = [ tstore[x] for x in stuff['orderedSources'] ]
+    lastSource = tstore[stuff['sources'][-1]]
+    #with open('%s%d.mos' % (args.mosaic, i), 'r') as ipf:
+    #    iline = ipf.readline()
+    #    while (iline != ""):
+    #        if iline.startswith("#") == False:
+    #            linel = [ x.strip() for x in iline.split(" ") ]
+    #            sname = linel[-1].replace('$', '')
+    #            segmentOrdered[i].append(tstore[sname])
+    #            if sname != segmentSeeds[i].name:
+    #                seedAssociations[segmentSeeds[i].name].append(tstore[sname])
+    #            lastSource = tstore[sname]
+    #        else:
+    #            linel = [ x.strip() for x in iline.split(" ") ]
+    #            if iline.startswith("# Start LST is"):
+    #                segstart = linel[4]
+    #            elif iline.startswith("# End LST is"):
+    #                segend = linel[4]
+    #            elif iline.startswith("# Reference position ="):
+    #                segra = linel[4]
+    #                segdec = linel[5]
+    #        iline = ipf.readline()
     print "ordered source list"
-    segmentEstimates.append({'startLST': segstart, 'endLST': segend,
-                             'refRA': segra, 'refDec': segdec})
+    segmentEstimates.append(stuff)
+    #segmentEstimates.append({'startLST': segstart, 'endLST': segend,
+    #                         'refRA': segra, 'refDec': segdec})
     for j in xrange(0, len(segmentOrdered[i])):
         print " src %d: %s %s %s" % ((j + 1), segmentOrdered[i][j].name,
                                      segmentOrdered[i][j].a_ra,
@@ -581,8 +641,9 @@ for src in nvisits:
                 del sourceList[i]
                 break
 nn = 1
-while nn in visitSummary:
-    print "%d sources are visited %d times" % (visitSummary[nn], nn)
+while nn < 100:
+    if nn in visitSummary:
+        print "%d sources are visited %d times" % (visitSummary[nn], nn)
     nn += 1
     
 
