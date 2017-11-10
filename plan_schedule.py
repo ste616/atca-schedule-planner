@@ -78,7 +78,23 @@ def createAtcaObject(horizon=12):
 
     return atca
 
-
+def lstToObservatory(observatory=None, startTime=None, targetLst=None):
+    if observatory is not None and startTime is not None and targetLst is not None:
+        observatory.date = startTime
+        startLst = "%s" % observatory.sidereal_time()
+        aLst = lstToSeconds(startLst)
+        bLst = lstToSeconds(targetLst)
+        if bLst < aLst:
+            bLst += 86400.
+        dLst = bLst - aLst
+        while abs(dLst) > 2:
+            dDays = dLst / 86400.
+            observatory.date += dDays
+            startLst = "%s" % observatory.sidereal_time()
+            aLst = lstToSeconds(startLst)
+            bLst = lstToSeconds(targetLst)
+            dLst = bLst - aLst
+        
 def createSource(name=None, rightAscension=None, declination=None):
     # Make a pyEphem fixed body object.
     if name is not None and rightAscension is not None and declination is not None:
@@ -165,6 +181,58 @@ def lstToSeconds(lstString):
     lst = float(comps[0]) * 3600. + float(comps[1]) * 60. + float(comps[2])
     return lst
 
+def storeSourcesToDict(sourceDict=None, sourceList=None):
+    if sourceDict is None:
+        sourceDict = {}
+    if sourceList is not None:
+        for i in xrange(0, len(sourceList)):
+            sourceDict[sourceList[i].name] = sourceList[i]
+    return sourceDict
+
+def createSourceFile(seedSource=None, sourceList=None, fileName=None):
+    if seedSource is not None and sourceList is not None and fileName is not None:
+        with open(fileName, 'w') as opf:
+            ostring = "%s %s %s\n" % (seedSource.name, seedSource.a_ra,
+                                      seedSource.a_dec)
+            opf.write(ostring)
+            for i in xrange(0, len(sourceList)):
+                ostring = "%s %s %s\n" % (sourceList[i].name, sourceList[i].a_ra,
+                                          sourceList[i].a_dec)
+                opf.write(ostring)
+                
+
+def findSegmentSources(seedSource=None, possibleSources=None, maxSlewTime=None, observatory=None,
+                       segmentStartTime=None, nVisits=None, maxVisits=None, excludeSources=None):
+    if (seedSource is not None and possibleSources is not None and maxSlewTime is not None and
+        observatory is not None and segmentStartTime is not None and nVisits is not None and
+        maxVisits is not None):
+        segmentSlewTimes = []
+        seedPosition = timeToPosition(source=seedSource, observatory=observatory,
+                                      time=segmentStartTime)
+        for i in xrange(0, len(possibleSources)):
+            if seedSource.name != possibleSources[i].name:
+                sourcePosition = timeToPosition(source=possibleSources[i], observatory=observatory,
+                                                time=segmentStartTime)
+                segmentSlewTimes.append((possibleSources[i], calcSlewTime(seedPosition, sourcePosition)))
+        sortedSlewTimes = sorted(segmentSlewTimes, key=lambda s: s[1])
+        observeSources = []
+        totalSlewTime = 0.
+        for i in xrange(0, len(sortedSlewTimes)):
+            if totalSlewTime > maxSlewTime:
+                break
+            if sortedSlewTimes[i][0].name in nVisits and nVisits[sortedSlewTimes[i][0].name] >= maxVisits:
+                continue
+            if excludeSources is not None and sortedSlewTimes[i][0].name in excludeSources:
+                continue
+            totalSlewTime += (sortedSlewTimes[i][1] / 60.)
+            observeSources.append(sortedSlewTimes[i][0])
+            if sortedSlewTimes[i][0].name not in nVisits:
+                nVisits[sortedSlewTimes[i][0].name] = 1
+            else:
+                nVisits[sortedSlewTimes[i][0].name] += 1
+        return observeSources
+    return None
+
 def prepareMosaic(fileList=None, mosaicFile=None, lst=None, refPos=None, interval=None, nCycles=None, seed=None):
     # Make a mosaic file and interpret the results.
     if (fileList is not None and mosaicFile is not None and lst is not None and refPos is not None and
@@ -203,7 +271,7 @@ def prepareMosaic(fileList=None, mosaicFile=None, lst=None, refPos=None, interva
         if endLst < startLst:
             # Date change.
             endLst += 86400.
-        duration = (endLst - startLst) * ((23.+ 56. / 60.) / 24.)
+        duration = (endLst - startLst) * (24. / (23.+ 56. / 60.))
         return { 'startLST': segstart, 'endLST': segend, 'sources': sources,
                  'orderedSources': ordered,
                  'refRA': segra, 'refDec': segdec, 'duration': duration }
@@ -253,6 +321,8 @@ parser.add_argument('-o', "--output", default="test.sch",
                     help="the name of the schedule file to output")
 parser.add_argument('-a', "--altered", default="",
                     help="the name of the file to output with the list of sources, excluding the ones successfully scheduled")
+parser.add_argument('-L', "--slop", default=20.0,
+                    help="the maximum amount of slop in the schedule, in minutes")
 
 args = parser.parse_args()
 
@@ -461,7 +531,9 @@ for i in xrange(0, len(segmentSeeds)):
         print "Segment %d has no seed" % (i + 1)
     else:
         print "Segment %d is seeded by %s" % ((i + 1), segmentSeeds[i].name)
+
     
+        
 # Next step is to find the sources nearby to each seed source in each segment.
 # We use the threshold that allows for 15% overhead. That is, say we have a 15 min
 # segment, we must spend 85% of that time on source, so only 15% can be spent
@@ -470,112 +542,156 @@ for i in xrange(0, len(segmentSeeds)):
 integrationPerSegment = 0.85 * halfSpacing * (60. * 24.) # in minutes
 maxSlewTime = 0.15 * halfSpacing * (60. * 24.)
 nSourcesPerSegment = int(math.floor(integrationPerSegment / fullDuration))
-lastSource = None
-segmentOrdered = []
-segmentEstimates = []
-seedAssociations = {}
-for i in xrange(0, len(segmentSeeds)):
-    # For each segment, sort the sources by increasing slew time from
-    # the seed source, and select the closest nSourcesPerSegment.
-    if segmentSeeds[i] is None:
-        segmentOrdered.append(None)
-        segmentEstimates.append(None)
-        continue
-    print "Segment %d:" % i
-    segmentOrdered.append([])
-    seedPosition = timeToPosition(source=segmentSeeds[i], observatory=atca, time=segmentTimes[i])
-    segmentSlewTimes = []
-    if segmentSeeds[i].name in seedAssociations:
-        # We assume we continue using the same sources as before.
-        for j in xrange(0, len(seedAssociations[segmentSeeds[i].name])):
-            sourcePosition = timeToPosition(source=seedAssociations[segmentSeeds[i].name][j],
-                                            observatory=atca, time=segmentTimes[i])
-            segmentSlewTimes.append((seedAssociations[segmentSeeds[i].name][j],
-                                     calcSlewTime(seedPosition, sourcePosition)))
-    else:
-        for j in xrange(0, len(segmentSources[i])):
-            if segmentSeeds[i].name != segmentSources[i][j].name:
-                sourcePosition = timeToPosition(source=segmentSources[i][j], observatory=atca, time=segmentTimes[i])
-                segmentSlewTimes.append((segmentSources[i][j], calcSlewTime(seedPosition, sourcePosition)))
-    sortedSlewTimes = sorted(segmentSlewTimes, key=lambda s: s[1])
-    #print "Slew times around seed %s (%s %s)" % (segmentSeeds[i].name, segmentSeeds[i].a_ra,
-    #                                             segmentSeeds[i].a_dec)
-    tstore = {}
-    tstore[segmentSeeds[i].name] = segmentSeeds[i]
-    for j in xrange(0, len(sortedSlewTimes)):
-        #print "  Source %s (%s %s), slew time is %.2f mins" % (sortedSlewTimes[j][0].name,
-        #                                                       sortedSlewTimes[j][0].a_ra,
-        #                                                       sortedSlewTimes[j][0].a_dec,
-        #                                                       (sortedSlewTimes[j][1] / 60.))
-        tstore[sortedSlewTimes[j][0].name] = sortedSlewTimes[j][0]
-    # Now we take the necessary number of sources, and output them to a file
-    # so we can run them through atmos.
-    totalSlewTime = 0.
-    with open('temp_atmos.txt', 'w') as opf:
-        ostring = "%s %s %s\n" % (segmentSeeds[i].name, segmentSeeds[i].a_ra,
-                                  segmentSeeds[i].a_dec)
-        opf.write(ostring)
-        for j in xrange(0, min((nSourcesPerSegment - 1), len(sortedSlewTimes))):
-            if totalSlewTime > maxSlewTime:
-                break
-            ostring = "%s %s %s\n" % (sortedSlewTimes[j][0].name,
-                                      sortedSlewTimes[j][0].a_ra,
-                                      sortedSlewTimes[j][0].a_dec)
-            opf.write(ostring)
-            totalSlewTime += (sortedSlewTimes[j][1] / 60.)
-            print "  Source %s (%s %s), slew time is %.2f mins, total %.2f / %.2f mins" % (sortedSlewTimes[j][0].name,
-                                                                                           sortedSlewTimes[j][0].a_ra,
-                                                                                           sortedSlewTimes[j][0].a_dec,
-                                                                                           (sortedSlewTimes[j][1] / 60.),
-                                                                                           totalSlewTime, maxSlewTime)
-    # Now run atmos.
-    refpos=""
-    if lastSource is not None:
-        refpos = "ref=%s,%s,%s" % (lastSource.name, lastSource.a_ra,
-                                   lastSource.a_dec)
-    atca.date = segmentTimes[i]
-    stuff = prepareMosaic(fileList="temp_atmos.txt", mosaicFile="%s%d" % (args.mosaic, i), seed=segmentSeeds[i].name,
-                          lst=atca.sidereal_time(), refPos=refpos, interval=int(args.cycletime),
-                          nCycles=int((args.duration * 60.) / args.cycletime))
-    #atmosCommand = "atmos source=temp_atmos.txt out=%s%d.mos %s lst=%s interval=%d cycles=%d> /dev/null" % (args.mosaic, i, refpos, atca.sidereal_time(), int(args.cycletime), int((args.duration * 60.) / args.cycletime))
-    #os.system(atmosCommand)
-    ## Read in the order it was sorted into.
-    #segstart = ""
-    #segend = ""
-    #segra = ""
-    #segdec = ""
-    #seedAssociations[segmentSeeds[i].name] = []
-    seedAssociations[segmentSeeds[i].name] = [ tstore[x] for x in stuff['sources'] ]
-    segmentOrdered[i] = [ tstore[x] for x in stuff['orderedSources'] ]
-    lastSource = tstore[stuff['sources'][-1]]
-    #with open('%s%d.mos' % (args.mosaic, i), 'r') as ipf:
-    #    iline = ipf.readline()
-    #    while (iline != ""):
-    #        if iline.startswith("#") == False:
-    #            linel = [ x.strip() for x in iline.split(" ") ]
-    #            sname = linel[-1].replace('$', '')
-    #            segmentOrdered[i].append(tstore[sname])
-    #            if sname != segmentSeeds[i].name:
-    #                seedAssociations[segmentSeeds[i].name].append(tstore[sname])
-    #            lastSource = tstore[sname]
-    #        else:
-    #            linel = [ x.strip() for x in iline.split(" ") ]
-    #            if iline.startswith("# Start LST is"):
-    #                segstart = linel[4]
-    #            elif iline.startswith("# End LST is"):
-    #                segend = linel[4]
-    #            elif iline.startswith("# Reference position ="):
-    #                segra = linel[4]
-    #                segdec = linel[5]
-    #        iline = ipf.readline()
-    print "ordered source list"
-    segmentEstimates.append(stuff)
-    #segmentEstimates.append({'startLST': segstart, 'endLST': segend,
-    #                         'refRA': segra, 'refDec': segdec})
-    for j in xrange(0, len(segmentOrdered[i])):
-        print " src %d: %s %s %s" % ((j + 1), segmentOrdered[i][j].name,
-                                     segmentOrdered[i][j].a_ra,
-                                     segmentOrdered[i][j].a_dec)
+extraSlewTime = [ 0. for x in segmentSeeds ]
+slop = args.slop + 1.
+excludeSources = [ x.name if x is not None else None for x in segmentSeeds ]
+while slop > args.slop:
+    lastSource = None
+    segmentOrdered = []
+    segmentEstimates = []
+    seedAssociations = {}
+    sourceVisits = {}
+    for i in xrange(0, len(segmentSeeds)):
+        # For each segment, sort the sources by increasing slew time from
+        # the seed source, and select the closest nSourcesPerSegment.
+        segmentOrdered.append([])
+        if segmentSeeds[i] is None:
+            segmentEstimates.append(None)
+            continue
+        print "Segment %d:" % i
+        sourcesInSegment = []
+        if segmentSeeds[i].name in seedAssociations:
+            sourcesInSegment = findSegmentSources(seedSource=segmentSeeds[i], nVisits=sourceVisits,
+                                                  possibleSources=seedAssociations[segmentSeeds[i]],
+                                                  maxSlewTime=(maxSlewTime + extraSlewTime[i]),
+                                                  observatory=atca, segmentStartTime=segmentTimes[i],
+                                                  maxVisits=args.nvisits, excludeSources=excludeSources)
+        else:
+            sourcesInSegment = findSegmentSources(seedSource=segmentSeeds[i], nVisits=sourceVisits,
+                                                  possibleSources=segmentSources[i],
+                                                  maxSlewTime=(maxSlewTime + extraSlewTime[i]),
+                                                  observatory=atca, segmentStartTime=segmentTimes[i],
+                                                  maxVisits=args.nvisits, excludeSources=excludeSources)
+            seedAssociations[segmentSeeds[i]] = sourcesInSegment
+        # Make the mosaic file.
+        createSourceFile(seedSource=segmentSeeds[i], sourceList=sourcesInSegment, fileName="temp_atmos.txt")
+        refpos = ""
+        if lastSource is not None:
+            refpos = "ref=%s,%s,%s" % (lastSource.name, lastSource.a_ra, lastSource.a_dec)
+        atca.date = segmentTimes[i]
+        mosaicResult = prepareMosaic(fileList="temp_atmos.txt", mosaicFile="%s%d" % (args.mosaic, i),
+                                     seed=segmentSeeds[i].name, lst=atca.sidereal_time(), refPos=refpos,
+                                     interval=int(args.cycletime), nCycles=int((args.duration * 60.) / args.cycletime))
+        # Keep a dictionary.
+        tstore = storeSourcesToDict(sourceList=[ segmentSeeds[i] ])
+        tstore = storeSourcesToDict(sourceDict=tstore, sourceList=sourcesInSegment)
+        if segmentSeeds[i].name not in seedAssociations:
+            seedAssociations[segmentSeeds[i].name] = [ tstore[x] for x in mosaicResult['sources'] ]
+        segmentOrdered[i] = [ tstore[x] for x in mosaicResult['orderedSources'] ]
+        lastSource = tstore[mosaicResult['orderedSources'][-1]]
+        segmentEstimates.append(mosaicResult)
+        for j in xrange(0, len(segmentOrdered[i])):
+            print " src %d: %s %s %s" % ((j + 1), segmentOrdered[i][j].name,
+                                         segmentOrdered[i][j].a_ra,
+                                         segmentOrdered[i][j].a_dec)
+
+    # Work out tha amount of slop in the schedule.
+    slop = 0.
+    print "schedule estimated times follow:"
+    totalSourceVisits = 0
+    diffBack = 1
+    for i in xrange(0, len(segmentSeeds)):
+        if segmentSeeds[i] is None:
+            diffBack += 1
+            continue
+        print "  segment %d: LST %s - %s, %d sources" % (i, segmentEstimates[i]['startLST'],
+                                                         segmentEstimates[i]['endLST'],
+                                                         len(segmentOrdered[i]))
+        # Work out the slew time between the last source and the projected next LST.
+        if i > 0:
+            lstToObservatory(atca, ephem.Date(startDate), segmentEstimates[i - diffBack]['endLST'])
+            lastPos = timeToPosition(source=segmentOrdered[i - diffBack][-1], observatory=atca,
+                                     time=atca.date)
+            nextPos = timeToPosition(source=segmentOrdered[i][0], observatory=atca,
+                                     time=atca.date)
+            segSlew = calcSlewTime(lastPos, nextPos)
+            # And then work out the LST difference.
+            lstDiff = lstToSeconds(segmentEstimates[i]['startLST']) - lstToSeconds(segmentEstimates[i - diffBack]['endLST'])
+            # The slewing time doesn't count as slop.
+            slopDiff = lstDiff - segSlew
+            slop += slopDiff / 60.
+            # Add more time to a segment is the slop is way too big.
+            if (slopDiff > 120):
+                extraSlewTime[i - diffBack] += (slopDiff / 120.)
+            print "             (LST diff = %.2f s, slew = %.2f s, slop %.2f min)" % (lstDiff, segSlew, (slopDiff / 60.))
+            diffBack = 1
+        print "             (extra slew time = %.2f min, total slop %.2f min)" % (extraSlewTime[i], slop)
+        
+
+    #segmentOrdered.append([])
+    #seedPosition = timeToPosition(source=segmentSeeds[i], observatory=atca, time=segmentTimes[i])
+    #segmentSlewTimes = []
+    #if segmentSeeds[i].name in seedAssociations:
+    #    # We assume we continue using the same sources as before.
+    #    for j in xrange(0, len(seedAssociations[segmentSeeds[i].name])):
+    #        sourcePosition = timeToPosition(source=seedAssociations[segmentSeeds[i].name][j],
+    #                                        observatory=atca, time=segmentTimes[i])
+    #        segmentSlewTimes.append((seedAssociations[segmentSeeds[i].name][j],
+    #                                 calcSlewTime(seedPosition, sourcePosition)))
+    #else:
+    #    for j in xrange(0, len(segmentSources[i])):
+    #        if segmentSeeds[i].name != segmentSources[i][j].name:
+    #            sourcePosition = timeToPosition(source=segmentSources[i][j], observatory=atca, time=segmentTimes[i])
+    #            segmentSlewTimes.append((segmentSources[i][j], calcSlewTime(seedPosition, sourcePosition)))
+    #sortedSlewTimes = sorted(segmentSlewTimes, key=lambda s: s[1])
+    ##print "Slew times around seed %s (%s %s)" % (segmentSeeds[i].name, segmentSeeds[i].a_ra,
+    ##                                             segmentSeeds[i].a_dec)
+    #tstore = {}
+    #tstore[segmentSeeds[i].name] = segmentSeeds[i]
+    #for j in xrange(0, len(sortedSlewTimes)):
+    #    #print "  Source %s (%s %s), slew time is %.2f mins" % (sortedSlewTimes[j][0].name,
+    #    #                                                       sortedSlewTimes[j][0].a_ra,
+    #    #                                                       sortedSlewTimes[j][0].a_dec,
+    #    #                                                       (sortedSlewTimes[j][1] / 60.))
+    #    tstore[sortedSlewTimes[j][0].name] = sortedSlewTimes[j][0]
+    ## Now we take the necessary number of sources, and output them to a file
+    ## so we can run them through atmos.
+    #totalSlewTime = 0.
+    #with open('temp_atmos.txt', 'w') as opf:
+    #    ostring = "%s %s %s\n" % (segmentSeeds[i].name, segmentSeeds[i].a_ra,
+    #                              segmentSeeds[i].a_dec)
+    #    opf.write(ostring)
+    #    for j in xrange(0, min((nSourcesPerSegment - 1), len(sortedSlewTimes))):
+    #        if totalSlewTime > maxSlewTime:
+    #            break
+    #        ostring = "%s %s %s\n" % (sortedSlewTimes[j][0].name,
+    #                                  sortedSlewTimes[j][0].a_ra,
+    #                                  sortedSlewTimes[j][0].a_dec)
+    #        opf.write(ostring)
+    #        totalSlewTime += (sortedSlewTimes[j][1] / 60.)
+    #        print "  Source %s (%s %s), slew time is %.2f mins, total %.2f / %.2f mins" % (sortedSlewTimes[j][0].name,
+    #                                                                                       sortedSlewTimes[j][0].a_ra,
+    #                                                                                       sortedSlewTimes[j][0].a_dec,
+    #                                                                                       (sortedSlewTimes[j][1] / 60.),
+    #                                                                                       totalSlewTime, maxSlewTime)
+    ## Now run atmos.
+    #refpos=""
+    #if lastSource is not None:
+    #    refpos = "ref=%s,%s,%s" % (lastSource.name, lastSource.a_ra,
+    #                               lastSource.a_dec)
+    #atca.date = segmentTimes[i]
+    #stuff = prepareMosaic(fileList="temp_atmos.txt", mosaicFile="%s%d" % (args.mosaic, i), seed=segmentSeeds[i].name,
+    #                      lst=atca.sidereal_time(), refPos=refpos, interval=int(args.cycletime),
+    #                      nCycles=int((args.duration * 60.) / args.cycletime))
+    #seedAssociations[segmentSeeds[i].name] = [ tstore[x] for x in stuff['sources'] ]
+    #segmentOrdered[i] = [ tstore[x] for x in stuff['orderedSources'] ]
+    #lastSource = tstore[stuff['sources'][-1]]
+    #print "ordered source list"
+    #segmentEstimates.append(stuff)
+    #for j in xrange(0, len(segmentOrdered[i])):
+    #    print " src %d: %s %s %s" % ((j + 1), segmentOrdered[i][j].name,
+    #                                 segmentOrdered[i][j].a_ra,
+    #                                 segmentOrdered[i][j].a_dec)
             
 # Create a CABB schedule.
 schedule = cabb.schedule()
@@ -601,26 +717,19 @@ schedule.addScan({
     'scanType': "Dwell"
 })
 nvisits = {}
-print "schedule estimated times follow:"
-totalSourceVisits = 0
 for i in xrange(0, len(segmentSeeds)):
-    if segmentSeeds[i] is None:
-        continue
-    schedule.addScan({
-        'source': "%s%d" % (args.mosaic, i),
-        'rightAscension': segmentEstimates[i]['refRA'],
-        'declination': segmentEstimates[i]['refDec'],
-        'scanType': "Mosaic", 'scanLength': rapidlib.minutesToScanLength(1)
-    })
-    print "  segment %d: LST %s - %s, %d sources" % (i, segmentEstimates[i]['startLST'],
-                                                     segmentEstimates[i]['endLST'],
-                                                     len(segmentOrdered[i]))
     totalSourceVisits += len(segmentOrdered[i])
     for j in xrange(0, len(segmentOrdered[i])):
         if segmentOrdered[i][j].name not in nvisits:
             nvisits[segmentOrdered[i][j].name] = 1
         else:
             nvisits[segmentOrdered[i][j].name] += 1
+        schedule.addScan({
+            'source': "%s%d" % (args.mosaic, i),
+            'rightAscension': segmentEstimates[i]['refRA'],
+            'declination': segmentEstimates[i]['refDec'],
+            'scanType': "Mosaic", 'scanLength': rapidlib.minutesToScanLength(1)
+        })
         #schedule.addScan({
         #    'source': segmentOrdered[i][j].name, 'rightAscension': segmentOrdered[i][j].a_ra,
         #    'declination': segmentOrdered[i][j].a_dec
@@ -652,21 +761,6 @@ if args.output.endswith(".sch") == False:
     args.output = args.output + ".sch"
 schedule.write(name=args.output)
 
-# Make a listing of the schedule.
-#listing = rapidlib.scheduleListing(schedule, atca, startDate)
-#print "schedule listing follows:"
-#nvisits = {}
-#for i in xrange(0, len(listing)):
-#    sname = schedule.getScan(i).getSource()
-#    if sname not in nvisits:
-#        nvisits[sname] = 1
-#    else:
-#        nvisits[sname] += 1
-#    print "Source %s: from %s - %s, el %.1f (visit %d)" % (sname,
-#                                                           listing[i]['start']['time'],
-#                                                           listing[i]['end']['time'],
-#                                                           listing[i]['start']['el'],
-#                                                           nvisits[sname])
 
 # Output the altered list if asked to.
 if args.altered != "":
