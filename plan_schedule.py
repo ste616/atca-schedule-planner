@@ -83,7 +83,11 @@ def lstToObservatory(observatory=None, startTime=None, targetLst=None):
         observatory.date = startTime
         startLst = "%s" % observatory.sidereal_time()
         aLst = lstToSeconds(startLst)
+        if aLst > 86400:
+            aLst -= 86400
         bLst = lstToSeconds(targetLst)
+        if bLst > 86400:
+            bLst -= 86400
         if bLst < aLst:
             bLst += 86400.
         dLst = bLst - aLst
@@ -92,7 +96,11 @@ def lstToObservatory(observatory=None, startTime=None, targetLst=None):
             observatory.date += dDays
             startLst = "%s" % observatory.sidereal_time()
             aLst = lstToSeconds(startLst)
+            if aLst > 86400:
+                aLst -= 86400
             bLst = lstToSeconds(targetLst)
+            if bLst > 86400:
+                bLst -= 86400
             dLst = bLst - aLst
         
 def createSource(name=None, rightAscension=None, declination=None):
@@ -323,7 +331,7 @@ parser.add_argument('-o', "--output", default="test.sch",
                     help="the name of the schedule file to output")
 parser.add_argument('-a', "--altered", default="",
                     help="the name of the file to output with the list of sources, excluding the ones successfully scheduled")
-parser.add_argument('-L', "--slop", default=20.0,
+parser.add_argument('-L', "--slop", default=20.0, type=float,
                     help="the maximum amount of slop in the schedule, in minutes")
 
 args = parser.parse_args()
@@ -620,7 +628,11 @@ while slop > args.slop:
                                      time=atca.date)
             segSlew = calcSlewTime(lastPos, nextPos)
             # And then work out the LST difference.
-            lstDiff = lstToSeconds(segmentEstimates[i]['startLST']) - lstToSeconds(segmentEstimates[i - diffBack]['endLST'])
+            lstDiff1 = lstToSeconds(segmentEstimates[i]['startLST']) - lstToSeconds(segmentEstimates[i - diffBack]['endLST'])
+            lstDiff2 = (lstToSeconds(segmentEstimates[i]['startLST']) + 86400) - lstToSeconds(segmentEstimates[i - diffBack]['endLST'])
+            lstDiff = lstDiff1
+            if abs(lstDiff2) < abs(lstDiff1):
+                lstDiff = lstDiff2
             # The slewing time doesn't count as slop.
             slopDiff = lstDiff - segSlew
             slop += slopDiff / 60.
